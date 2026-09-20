@@ -1,0 +1,238 @@
+"use client";
+
+import { apiPath } from "@/lib/base-path";
+import { ssCacheGet, ssCacheSet, ssCacheClearBucket } from "@/lib/ss-cache";
+import { useState, useEffect, useCallback, useRef } from "react";
+import type { ApiComic, ComicsResponse } from "./useComicTypes";
+
+/**
+ * 客户端缓存：漫画列表 API 响应
+ * Key = userScope + URL 查询字符串, Value = { data, timestamp }
+ * SWR 语义：缓存（无论新旧）都用于首帧渲染，由后台刷新保证数据新鲜；
+ * 变更操作（扫描/删除/改标签等）通过 invalidateComicsCache 显式丢弃缓存。
+ * userScope 用于隔离不同用户的缓存，防止权限变更后看到旧数据。
+ * 持久化：同时写入 sessionStorage（ss-cache），手机返回整页重载时数据仍在，
+ * 首帧立即渲染（bfcache 被弹出的场景也不闪）。
+ */
+const comicsCache = new Map<string, { data: ComicsResponse; ts: number }>();
+const MAX_CACHE_ENTRIES = 20;
+const SS_BUCKET = "comics";
+const SS_MAX_ENTRIES = 6;
+export const LIBRARY_ACCESS_CHANGED_EVENT = "nowen-library-access-changed";
+export const COMICS_LOAD_ERROR_EVENT = "nowen-comics-load-error";
+
+/** 当前用户作用域，用于缓存 key 隔离不同用户的缓存 */
+let currentUserScope = "";
+
+/** 设置当前用户作用域（在 login/logout/refreshUser 时调用） */
+export function setUserScope(userId: string, role: string) {
+  const newScope = `${userId}:${role}`;
+  if (currentUserScope !== newScope) {
+    currentUserScope = newScope;
+    // 用户身份变更时清空所有缓存（内存 + sessionStorage）
+    comicsCache.clear();
+    ssCacheClearBucket(SS_BUCKET);
+  }
+}
+
+function getCachedResponse(key: string): ComicsResponse | null {
+  const entry = comicsCache.get(key);
+  if (entry) {
+    // SWR：缓存（无论新旧）都返回用于首帧渲染，避免从阅读器/详情页返回时
+    // 列表缓存过期导致骨架屏闪烁；后台 fetch 完成后会更新缓存。
+    return entry.data;
+  }
+  // 内存缓存未命中 → 尝试 sessionStorage（整页重载/bfcache 弹出后）
+  const persisted = ssCacheGet<ComicsResponse>(SS_BUCKET, key);
+  if (persisted) {
+    comicsCache.set(key, { data: persisted, ts: Date.now() });
+    return persisted;
+  }
+  return null;
+}
+
+function setCachedResponse(key: string, data: ComicsResponse) {
+  if (comicsCache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = comicsCache.keys().next().value;
+    if (oldest !== undefined) comicsCache.delete(oldest);
+  }
+  comicsCache.set(key, { data, ts: Date.now() });
+  ssCacheSet(SS_BUCKET, key, data, SS_MAX_ENTRIES);
+}
+
+/** 清除所有缓存（在变更操作后调用） */
+export function invalidateComicsCache() {
+  comicsCache.clear();
+  ssCacheClearBucket(SS_BUCKET);
+}
+
+/** 通知当前页面里的漫画列表刷新权限敏感数据。 */
+export function notifyLibraryAccessChanged() {
+  invalidateComicsCache();
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(LIBRARY_ACCESS_CHANGED_EVENT));
+  }
+}
+
+async function comicsResponseError(res: Response): Promise<string> {
+  let detail = "";
+  try {
+    const body = await res.json();
+    if (typeof body?.error === "string") detail = body.error.trim();
+  } catch {
+    // Non-JSON gateway/proxy errors are represented by the HTTP status below.
+  }
+  return detail || `图库内容加载失败（HTTP ${res.status}）`;
+}
+
+function notifyComicsLoadError(message: string) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent<string>(COMICS_LOAD_ERROR_EVENT, { detail: message }));
+}
+
+/**
+ * Hook: 获取漫画列表（带客户端缓存 + AbortController）
+ */
+export function useComics(options?: {
+  search?: string;
+  tags?: string[];
+  favoritesOnly?: boolean;
+  sortBy?: string;
+  sortOrder?: string;
+  page?: number;
+  pageSize?: number;
+  category?: string;
+  contentType?: string; // "comic" | "novel" | ""
+  excludeGrouped?: boolean; // 排除已在合集中的漫画（合集视图）
+  readingStatus?: string; // 用户级阅读状态筛选
+  uncategorized?: boolean;
+  untagged?: boolean;
+  libraryIds?: string[]; // 图库筛选：只返回这些图库的内容（空=不过滤）
+  seriesView?: boolean; // 将目录成员折叠为逻辑作品
+  folder?: string; // 文件夹浏览：只返回该相对目录的直接子项（"" = 库根）
+  folderMode?: boolean; // 是否启用文件夹过滤（配合 folder 使用，根目录也需置为 true）
+}) {
+  const [comics, setComics] = useState<ApiComic[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [fetching, setFetching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const initializedRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const fetchComics = useCallback(async () => {
+    // 取消之前的请求
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
+    const params = new URLSearchParams();
+    if (options?.search) params.set("search", options.search);
+    if (options?.tags?.length) params.set("tags", options.tags.join(","));
+    if (options?.favoritesOnly) params.set("favorites", "true");
+    if (options?.sortBy) params.set("sortBy", options.sortBy);
+    if (options?.sortOrder) params.set("sortOrder", options.sortOrder);
+    if (options?.seriesView) params.set("seriesView", "true");
+    if (options?.page) params.set("page", String(options.page));
+    if (options?.pageSize) params.set("pageSize", String(options.pageSize));
+    if (options?.category) params.set("category", options.category);
+    if (options?.contentType) params.set("contentType", options.contentType);
+    if (options?.excludeGrouped) params.set("excludeGrouped", "true");
+    if (options?.readingStatus) params.set("readingStatus", options.readingStatus);
+    if (options?.uncategorized) params.set("uncategorized", "true");
+    if (options?.untagged) params.set("untagged", "true");
+    if (options?.libraryIds && options.libraryIds.length > 0) params.set("libraryIds", options.libraryIds.join(","));
+    if (options?.folder !== undefined) params.set("folder", options.folder);
+    if (options?.folderMode) params.set("folderMode", "1");
+
+    const qs = params.toString();
+    // 缓存 key 包含用户作用域，防止不同用户间缓存串用
+    const cacheKey = `${currentUserScope}::${qs || "__default__"}`;
+    const url = `/api/comics${qs ? `?${qs}` : ""}`;
+
+    // Check client cache first
+    const cached = getCachedResponse(cacheKey);
+    if (cached) {
+      setComics(cached.comics);
+      setTotal(cached.total);
+      setTotalPages(cached.totalPages);
+      if (!initializedRef.current) {
+        initializedRef.current = true;
+        setLoading(false);
+      }
+    }
+
+    if (!initializedRef.current && !cached) {
+      setLoading(true);
+    }
+    setFetching(true);
+    setError(null);
+
+    try {
+      const res = await fetch(apiPath(url), { signal: abortController.signal, cache: "no-store" });
+      if (!res.ok) throw new Error(await comicsResponseError(res));
+      const data: ComicsResponse = await res.json();
+      // 检查请求是否被取消
+      if (abortController.signal.aborted) return;
+      const safeComics = (data.comics || []).map((c) => ({
+        ...c,
+        tags: c.tags || [],
+        categories: c.categories || [],
+      }));
+      setComics(safeComics);
+      setTotal(data.total);
+      setTotalPages(data.totalPages);
+      setCachedResponse(cacheKey, { ...data, comics: safeComics });
+      initializedRef.current = true;
+    } catch (err) {
+      // 忽略取消的请求
+      if (err instanceof Error && err.name === "AbortError") return;
+      if (!cached) {
+        const message = err instanceof Error ? err.message : "图库内容加载失败";
+        setError(message);
+        notifyComicsLoadError(message);
+      }
+    } finally {
+      // 只有当前请求没有被取消时才更新状态
+      if (!abortController.signal.aborted) {
+        setLoading(false);
+        setFetching(false);
+      }
+    }
+  }, [options?.search, JSON.stringify(options?.tags), options?.favoritesOnly, options?.sortBy, options?.sortOrder, options?.page, options?.pageSize, options?.category, options?.contentType, options?.excludeGrouped, options?.seriesView, options?.readingStatus, options?.uncategorized, options?.untagged, JSON.stringify(options?.libraryIds ?? []), options?.folder, options?.folderMode]);
+
+  useEffect(() => {
+    fetchComics();
+    return () => {
+      // 组件卸载时取消请求
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, [fetchComics]);
+
+  useEffect(() => {
+    const handleLibraryAccessChanged = () => {
+      initializedRef.current = false;
+      invalidateComicsCache();
+      fetchComics();
+    };
+    window.addEventListener(LIBRARY_ACCESS_CHANGED_EVENT, handleLibraryAccessChanged);
+    return () => window.removeEventListener(LIBRARY_ACCESS_CHANGED_EVENT, handleLibraryAccessChanged);
+  }, [fetchComics]);
+
+  const refetch = useCallback(async () => {
+    // 取消之前的请求
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    invalidateComicsCache();
+    return fetchComics();
+  }, [fetchComics]);
+
+  // 导出 setComics 供外部直接更新状态（乐观更新）
+  return { comics, setComics, loading, fetching, error, total, totalPages, refetch };
+}
