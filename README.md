@@ -61,7 +61,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist-linux/nowen-reader-linux-
 
 ## 📦 版本
 
-当前版本：**0.4.9**（加载参数优化版）
+当前版本：**0.4.10**（滑动防误触修复版）
 
 版本演进摘要：
 
@@ -73,6 +73,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist-linux/nowen-reader-linux-
 | 0.4.7 | 阅读页磁盘缓存默认关闭（`PAGE_CACHE_ENABLED` 开关） |
 | 0.4.8 | 加载策略整体回退作者原版（虚拟化 + 原生预加载） |
 | 0.4.9 | 仅调参数：预加载 12 / 渲染 7 / DOM 缓冲 20 / eager 5 |
+| 0.4.10 | 修复滑动误触 200% 放大：禁用双击/双触缩放、pinch 加 15% 死区、拦截 Ctrl+滚轮 |
 
 ## 📄 协议
 

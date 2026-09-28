@@ -196,6 +196,18 @@ export default function WebtoonView({
     return () => el.removeEventListener("touchmove", onTouchMove);
   }, []);
 
+  // Block Ctrl+wheel browser zoom inside the reader (native, passive:false).
+  // Scroll-wheel swipes with Ctrl held were zooming the whole page to 200%.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e: globalThis.WheelEvent) => {
+      if (e.ctrlKey) e.preventDefault();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   // Record actual image height after load
   const handleImageLoad = useCallback((index: number, e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
@@ -238,6 +250,11 @@ export default function WebtoonView({
     // Pinch-to-zoom
     if (e.touches.length === 2 && pinchStartDistRef.current !== null) {
       const currentDist = getTouchDistance(e.touches);
+      // 15% dead-zone: ignore tiny finger-distance jitter during two-finger
+      // scrolling so accidental swipes do not trigger zoom.
+      if (Math.abs(currentDist - pinchStartDistRef.current) / pinchStartDistRef.current < 0.15) {
+        return;
+      }
       const nextScale = Math.min(3, Math.max(1, pinchStartScaleRef.current * (currentDist / pinchStartDistRef.current)));
       setScale(nextScale);
       if (nextScale <= 1) {
@@ -275,20 +292,15 @@ export default function WebtoonView({
 
     panStartRef.current = null;
 
-    // Double-tap detection (only when not pinching)
+    // Tap-time bookkeeping only. Double-tap zoom is DISABLED on purpose:
+    // fast consecutive swipes (fling/inertia scrolling) were mis-detected as
+    // a double-tap and zoomed the strip to 200% while scrolling.
     const now = Date.now();
     if (now - lastTapTimeRef.current < 300 && e.changedTouches.length === 1) {
       lastTapTimeRef.current = 0;
       touchHandledRef.current = true;
       setTimeout(() => { touchHandledRef.current = false; }, 400);
-
-      if (scale > 1) {
-        setScale(1);
-        setTranslate({ x: 0, y: 0 });
-      } else {
-        setScale(2);
-        setTranslate({ x: 0, y: 0 });
-      }
+      // No zoom toggle — prevent accidental 200% zoom during swipe.
     } else {
       lastTapTimeRef.current = now;
     }
@@ -300,13 +312,9 @@ export default function WebtoonView({
   const handleDoubleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (scale > 1) {
-      setScale(1);
-      setTranslate({ x: 0, y: 0 });
-    } else {
-      setScale(2);
-      setTranslate({ x: 0, y: 0 });
-    }
+    // Double-click zoom disabled: it was too easy to trigger 200% zoom
+    // accidentally while scrolling in webtoon mode. Pinch-to-zoom remains
+    // the only way to zoom on touch devices.
   };
 
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -340,7 +348,7 @@ export default function WebtoonView({
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
-      style={scale > 1 ? { touchAction: "none" } : undefined}
+      style={scale > 1 ? { touchAction: "none" } : { touchAction: "pan-y" }}
     >
       <div
         className="mx-auto"
